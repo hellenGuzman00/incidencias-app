@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
@@ -663,7 +664,7 @@ class _ReportarPageState extends State<ReportarPage> {
 }
 
 // =========================================================
-// PESTAÑA 2: MIS REPORTES (acciones solo para Admin)
+// PESTAÑA 2: MIS REPORTES (búsqueda, filtros y acciones solo para Admin)
 // =========================================================
 class MisReportesPage extends StatefulWidget {
   const MisReportesPage({super.key});
@@ -674,32 +675,33 @@ class MisReportesPage extends StatefulWidget {
 
 class _MisReportesPageState extends State<MisReportesPage> {
   late Future<List<dynamic>> _futureIncidencias;
+  final TextEditingController _buscarController = TextEditingController();
+  Timer? _debounce;
+
+  // "" significa "sin filtro" (Todas / Todos)
+  String _categoriaFiltro = "";
+  String _estadoFiltro = "";
+  List<dynamic> _categorias = [];
   String _rolUsuario = "";
 
-  Future<List<dynamic>> _obtenerIncidencias() async {
-    final response = await http.get(Uri.parse("$baseUrl/incidencias"));
-    if (response.statusCode == 200) {
-      return jsonDecode(response.body);
-    } else {
-      throw Exception("Error al obtener datos");
-    }
-  }
-
-  Future<void> _recargar() async {
-    final nueva = _obtenerIncidencias();
-    setState(() {
-      _futureIncidencias = nueva;
-    });
-    try {
-      await nueva;
-    } catch (_) {}
-  }
+  bool get _hayFiltros =>
+      _buscarController.text.trim().isNotEmpty ||
+      _categoriaFiltro.isNotEmpty ||
+      _estadoFiltro.isNotEmpty;
 
   @override
   void initState() {
     super.initState();
-    _futureIncidencias = _obtenerIncidencias();
+    _futureIncidencias = _obtenerIncidenciasFiltradas();
+    _cargarCategorias();
     _obtenerRol();
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _buscarController.dispose();
+    super.dispose();
   }
 
   Future<void> _obtenerRol() async {
@@ -708,6 +710,82 @@ class _MisReportesPageState extends State<MisReportesPage> {
     setState(() {
       _rolUsuario = prefs.getString('rol') ?? "Usuario";
     });
+  }
+
+  Future<void> _cargarCategorias() async {
+    try {
+      final response = await http.get(Uri.parse("$baseUrl/categorias"));
+      if (response.statusCode == 200 && mounted) {
+        setState(() {
+          _categorias = jsonDecode(response.body);
+        });
+      }
+    } catch (_) {}
+  }
+
+  /// Arma la URL con los filtros activos, por ejemplo:
+  /// /incidencias?buscar=cable&categoria_id=2&estado=Pendiente
+  Future<List<dynamic>> _obtenerIncidenciasFiltradas() async {
+    final Map<String, String> queryParams = {};
+
+    final texto = _buscarController.text.trim();
+    if (texto.isNotEmpty) queryParams['buscar'] = texto;
+    if (_categoriaFiltro.isNotEmpty) {
+      queryParams['categoria_id'] = _categoriaFiltro;
+    }
+    if (_estadoFiltro.isNotEmpty) queryParams['estado'] = _estadoFiltro;
+
+    final uri = Uri.parse("$baseUrl/incidencias").replace(
+      queryParameters: queryParams.isEmpty ? null : queryParams,
+    );
+    final response = await http.get(uri);
+
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    } else {
+      throw Exception("Error al cargar incidencias");
+    }
+  }
+
+  void _aplicarFiltros() {
+    setState(() {
+      _futureIncidencias = _obtenerIncidenciasFiltradas();
+    });
+  }
+
+  /// Para "jalar para refrescar": vuelve a consultar con los filtros actuales.
+  Future<void> _recargar() async {
+    final nueva = _obtenerIncidenciasFiltradas();
+    setState(() {
+      _futureIncidencias = nueva;
+    });
+    try {
+      await nueva;
+    } catch (_) {}
+  }
+
+  /// Búsqueda en tiempo real: espera 400 ms sin que el usuario escriba
+  /// antes de consultar, para no mandar una petición por cada letra.
+  void _onBuscarChanged(String _) {
+    setState(() {}); // actualiza al instante el botón de limpiar (X)
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 400), _aplicarFiltros);
+  }
+
+  void _limpiarBusqueda() {
+    _debounce?.cancel();
+    _buscarController.clear();
+    _aplicarFiltros();
+  }
+
+  void _limpiarFiltros() {
+    _debounce?.cancel();
+    _buscarController.clear();
+    setState(() {
+      _categoriaFiltro = "";
+      _estadoFiltro = "";
+    });
+    _aplicarFiltros();
   }
 
   Future<void> _marcarComoResuelto(int id) async {
@@ -823,120 +901,263 @@ class _MisReportesPageState extends State<MisReportesPage> {
     );
   }
 
+  /// Desplegable con etiqueta flotante (Categoría / Estado).
+  Widget _desplegable({
+    required String etiqueta,
+    required String valor,
+    required List<DropdownMenuItem<String>> items,
+    required void Function(String) onCambio,
+  }) {
+    return InputDecorator(
+      decoration: InputDecoration(
+        labelText: etiqueta,
+        filled: true,
+        fillColor: Colors.white,
+        isDense: true,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        border: const OutlineInputBorder(),
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          value: valor,
+          isExpanded: true,
+          isDense: true,
+          items: items,
+          onChanged: (nuevo) {
+            if (nuevo != null) onCambio(nuevo);
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _barraDeFiltros() {
+    return Container(
+      color: Colors.grey[100],
+      padding: const EdgeInsets.all(10),
+      child: Column(
+        children: [
+          TextField(
+            controller: _buscarController,
+            onChanged: _onBuscarChanged,
+            textInputAction: TextInputAction.search,
+            onSubmitted: (_) {
+              _debounce?.cancel();
+              _aplicarFiltros();
+            },
+            decoration: InputDecoration(
+              hintText: "Buscar por descripción...",
+              prefixIcon: const Icon(Icons.search),
+              suffixIcon: _buscarController.text.isNotEmpty
+                  ? IconButton(
+                      icon: const Icon(Icons.clear),
+                      tooltip: "Borrar búsqueda",
+                      onPressed: _limpiarBusqueda,
+                    )
+                  : null,
+              filled: true,
+              fillColor: Colors.white,
+              contentPadding:
+                  const EdgeInsets.symmetric(vertical: 0, horizontal: 15),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: _desplegable(
+                  etiqueta: "Categoría",
+                  valor: _categoriaFiltro,
+                  items: [
+                    const DropdownMenuItem<String>(
+                        value: "", child: Text("Todas")),
+                    ..._categorias.map<DropdownMenuItem<String>>(
+                      (c) => DropdownMenuItem<String>(
+                        value: c['id'].toString(),
+                        child: Text(
+                          c['nombre'].toString(),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                  ],
+                  onCambio: (nuevo) {
+                    setState(() {
+                      _categoriaFiltro = nuevo;
+                    });
+                    _aplicarFiltros();
+                  },
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _desplegable(
+                  etiqueta: "Estado",
+                  valor: _estadoFiltro,
+                  items: const [
+                    DropdownMenuItem<String>(value: "", child: Text("Todos")),
+                    DropdownMenuItem<String>(
+                        value: "Pendiente", child: Text("Pendiente")),
+                    DropdownMenuItem<String>(
+                        value: "Resuelto", child: Text("Resuelto")),
+                  ],
+                  onCambio: (nuevo) {
+                    setState(() {
+                      _estadoFiltro = nuevo;
+                    });
+                    _aplicarFiltros();
+                  },
+                ),
+              ),
+            ],
+          ),
+          if (_hayFiltros)
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton.icon(
+                onPressed: _limpiarFiltros,
+                icon: const Icon(Icons.filter_alt_off, size: 18),
+                label: const Text("Limpiar filtros"),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<List<dynamic>>(
-      future: _futureIncidencias,
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Center(child: CircularProgressIndicator());
-        } else if (snapshot.hasError) {
-          return mensajeRefrescable(
-              "No se pudieron cargar los reportes.\nDesliza hacia abajo para reintentar.",
-              _recargar);
-        } else if (!snapshot.hasData || snapshot.data!.isEmpty) {
-          return mensajeRefrescable("No hay incidencias registradas", _recargar);
-        }
+    return Column(
+      children: [
+        _barraDeFiltros(),
+        Expanded(
+          child: FutureBuilder<List<dynamic>>(
+            future: _futureIncidencias,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Center(child: CircularProgressIndicator());
+              } else if (snapshot.hasError) {
+                return mensajeRefrescable(
+                    "No se pudieron cargar los reportes.\nDesliza hacia abajo para reintentar.",
+                    _recargar);
+              } else if (!snapshot.hasData || snapshot.data!.isEmpty) {
+                return mensajeRefrescable(
+                    _hayFiltros
+                        ? "No se encontraron incidencias con esos filtros"
+                        : "No hay incidencias registradas",
+                    _recargar);
+              }
 
-        final lista = snapshot.data!;
-        return RefreshIndicator(
-          onRefresh: _recargar,
-          child: ListView.builder(
-            physics: const AlwaysScrollableScrollPhysics(),
-            itemCount: lista.length,
-            itemBuilder: (context, index) {
-              final item = lista[index];
-              final String? nombreImagen = item['imagen'];
-              final String estado = item['estado'] ?? 'Pendiente';
-              final int id = item['id'];
+              final lista = snapshot.data!;
+              return RefreshIndicator(
+                onRefresh: _recargar,
+                child: ListView.builder(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  keyboardDismissBehavior:
+                      ScrollViewKeyboardDismissBehavior.onDrag,
+                  itemCount: lista.length,
+                  itemBuilder: (context, index) {
+                    final item = lista[index];
+                    final String? nombreImagen = item['imagen'];
+                    final String estado = item['estado'] ?? 'Pendiente';
+                    final int id = item['id'];
 
-              return Card(
-                margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                child: ListTile(
-                  isThreeLine: true,
-                  onTap: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) =>
-                            DetalleIncidenciaPage(incidencia: item),
+                    return Card(
+                      margin: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 6),
+                      child: ListTile(
+                        isThreeLine: true,
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (context) =>
+                                  DetalleIncidenciaPage(incidencia: item),
+                            ),
+                          );
+                        },
+                        leading: nombreImagen != null
+                            ? ClipRRect(
+                                borderRadius: BorderRadius.circular(4),
+                                child: Image.network(
+                                  "$baseUrl/uploads/$nombreImagen",
+                                  width: 50,
+                                  height: 50,
+                                  fit: BoxFit.cover,
+                                  errorBuilder: (context, error, stackTrace) =>
+                                      const Icon(Icons.broken_image, size: 40),
+                                ),
+                              )
+                            : const Icon(Icons.report_problem,
+                                size: 40, color: Colors.orange),
+                        title: Text(
+                          item['categoria'] ?? 'Sin Categoría',
+                          style: const TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                        subtitle: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              item['descripcion'] ?? '',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            Text(
+                              "Por: ${item['usuario'] ?? 'Anónimo'}",
+                              style: TextStyle(
+                                  color: Colors.grey[600], fontSize: 12),
+                            ),
+                          ],
+                        ),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Chip(
+                              label: Text(
+                                estado,
+                                style: const TextStyle(
+                                    color: Colors.white, fontSize: 10),
+                              ),
+                              backgroundColor: estado == 'Resuelto'
+                                  ? Colors.green
+                                  : Colors.orange,
+                            ),
+                            // Solo el Admin puede resolver y eliminar
+                            if (_rolUsuario == 'Admin') ...[
+                              if (estado != 'Resuelto')
+                                IconButton(
+                                  padding: EdgeInsets.zero,
+                                  constraints: const BoxConstraints(
+                                      minWidth: 36, minHeight: 36),
+                                  icon: const Icon(Icons.check_circle_outline,
+                                      color: Colors.green),
+                                  tooltip: "Marcar como Resuelto",
+                                  onPressed: () => _mostrarDialogoResolver(id),
+                                ),
+                              IconButton(
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints(
+                                    minWidth: 36, minHeight: 36),
+                                icon: const Icon(Icons.delete_outline,
+                                    color: Colors.red),
+                                tooltip: "Eliminar Reporte",
+                                onPressed: () => _mostrarDialogoEliminar(id),
+                              ),
+                            ],
+                          ],
+                        ),
                       ),
                     );
                   },
-                  leading: nombreImagen != null
-                      ? ClipRRect(
-                          borderRadius: BorderRadius.circular(4),
-                          child: Image.network(
-                            "$baseUrl/uploads/$nombreImagen",
-                            width: 50,
-                            height: 50,
-                            fit: BoxFit.cover,
-                            errorBuilder: (context, error, stackTrace) =>
-                                const Icon(Icons.broken_image, size: 40),
-                          ),
-                        )
-                      : const Icon(Icons.report_problem,
-                          size: 40, color: Colors.orange),
-                  title: Text(
-                    item['categoria'] ?? 'Sin Categoría',
-                    style: const TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  subtitle: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        item['descripcion'] ?? '',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      Text(
-                        "Por: ${item['usuario'] ?? 'Anónimo'}",
-                        style: TextStyle(color: Colors.grey[600], fontSize: 12),
-                      ),
-                    ],
-                  ),
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Chip(
-                        label: Text(
-                          estado,
-                          style:
-                              const TextStyle(color: Colors.white, fontSize: 10),
-                        ),
-                        backgroundColor:
-                            estado == 'Resuelto' ? Colors.green : Colors.orange,
-                      ),
-                      // Solo el Admin puede resolver y eliminar
-                      if (_rolUsuario == 'Admin') ...[
-                        if (estado != 'Resuelto')
-                          IconButton(
-                            padding: EdgeInsets.zero,
-                            constraints:
-                                const BoxConstraints(minWidth: 36, minHeight: 36),
-                            icon: const Icon(Icons.check_circle_outline,
-                                color: Colors.green),
-                            tooltip: "Marcar como Resuelto",
-                            onPressed: () => _mostrarDialogoResolver(id),
-                          ),
-                        IconButton(
-                          padding: EdgeInsets.zero,
-                          constraints:
-                              const BoxConstraints(minWidth: 36, minHeight: 36),
-                          icon: const Icon(Icons.delete_outline,
-                              color: Colors.red),
-                          tooltip: "Eliminar Reporte",
-                          onPressed: () => _mostrarDialogoEliminar(id),
-                        ),
-                      ],
-                    ],
-                  ),
                 ),
               );
             },
           ),
-        );
-      },
+        ),
+      ],
     );
   }
 }

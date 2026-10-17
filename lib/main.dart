@@ -34,6 +34,46 @@ Future<void> sesionExpirada(BuildContext context) async {
   );
 }
 
+/// Cierra la sesión: borra TODO lo guardado localmente (token, nombre, rol)
+/// y regresa al Login eliminando las pantallas anteriores, para que el botón
+/// "atrás" no pueda volver a los módulos privados.
+Future<void> cerrarSesion(BuildContext context) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.clear();
+  if (!context.mounted) return;
+  Navigator.of(context).pushAndRemoveUntil(
+    MaterialPageRoute(builder: (_) => const LoginPage()),
+    (route) => false,
+  );
+}
+
+/// Pregunta antes de salir. Se usa tanto en la barra superior como en el Perfil,
+/// para que cerrar sesión funcione igual en los dos lugares.
+Future<void> confirmarCierreSesion(BuildContext context) async {
+  final confirmar = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text("Cerrar Sesión"),
+      content: const Text("¿Está seguro de que desea salir de la aplicación?"),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogContext, false),
+          child: const Text("Cancelar"),
+        ),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+          onPressed: () => Navigator.pop(dialogContext, true),
+          child: const Text("Cerrar Sesión"),
+        ),
+      ],
+    ),
+  );
+
+  if (confirmar == true && context.mounted) {
+    await cerrarSesion(context);
+  }
+}
+
 String formatearFecha(dynamic valor) {
   final DateTime? fecha = DateTime.tryParse('$valor')?.toLocal();
   if (fecha == null) return 'Desconocida';
@@ -451,16 +491,6 @@ class _NavigationPageState extends State<NavigationPage> {
     });
   }
 
-  Future<void> _cerrarSesion() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.clear();
-    if (!mounted) return;
-    Navigator.pushReplacement(
-      context,
-      MaterialPageRoute(builder: (context) => const LoginPage()),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -472,10 +502,20 @@ class _NavigationPageState extends State<NavigationPage> {
         backgroundColor: Colors.red,
         actions: [
           IconButton(
+            icon: const Icon(Icons.account_circle),
+            tooltip: "Mi perfil",
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const PerfilPage()),
+              );
+            },
+          ),
+          IconButton(
             icon: const Icon(Icons.logout),
             tooltip: "Cerrar Sesión",
-            onPressed: _cerrarSesion,
-          )
+            onPressed: () => confirmarCierreSesion(context),
+          ),
         ],
       ),
       body: _paginas[_currentIndex],
@@ -1635,6 +1675,201 @@ class VisorImagenPage extends StatelessWidget {
               color: Colors.white54,
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+// =========================================================
+// PANTALLA DE PERFIL DE USUARIO (Guía 8)
+// =========================================================
+class PerfilPage extends StatefulWidget {
+  const PerfilPage({super.key});
+
+  @override
+  State<PerfilPage> createState() => _PerfilPageState();
+}
+
+class _PerfilPageState extends State<PerfilPage> {
+  Map<String, dynamic>? _usuarioData;
+  bool _cargando = true;
+  String? _error;
+  // true si el rol guardado en el token ya no coincide con el de la base de datos
+  bool _rolDesactualizado = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _obtenerPerfil();
+  }
+
+  /// Pide los datos ACTUALES del usuario al servidor, enviando el token guardado.
+  Future<void> _obtenerPerfil() async {
+    setState(() {
+      _cargando = true;
+      _error = null;
+    });
+
+    try {
+      final token = await obtenerToken();
+      final response = await http.get(
+        Uri.parse("$baseUrl/perfil"),
+        headers: {"Authorization": "Bearer $token"},
+      );
+
+      if (!mounted) return;
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final prefs = await SharedPreferences.getInstance();
+        final rolLocal = prefs.getString('rol') ?? "";
+        if (!mounted) return;
+        setState(() {
+          _usuarioData = data;
+          _rolDesactualizado = rolLocal.isNotEmpty && rolLocal != data['rol'];
+          _cargando = false;
+        });
+      } else if (response.statusCode == 401 || response.statusCode == 403) {
+        // Token inválido o vencido: se destruye la sesión y se vuelve al Login
+        await sesionExpirada(context);
+      } else {
+        setState(() {
+          _error = "No se pudo cargar la información del usuario";
+          _cargando = false;
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = "Error de conexión. Verifica tu internet e intenta de nuevo.";
+        _cargando = false;
+      });
+    }
+  }
+
+  Widget _tarjetaDato(IconData icono, String titulo, String valor) {
+    return Card(
+      elevation: 3,
+      child: ListTile(
+        leading: Icon(icono, color: Colors.red),
+        title: Text(titulo),
+        subtitle: Text(valor),
+      ),
+    );
+  }
+
+  List<Widget> _contenidoPerfil() {
+    final data = _usuarioData!;
+    final String nombre = (data['nombre'] ?? '').toString();
+    final String inicial = nombre.isNotEmpty ? nombre[0].toUpperCase() : "?";
+    final String miembroDesde =
+        formatearFecha(data['fecha_registro']).split(' ').first;
+
+    return [
+      const SizedBox(height: 10),
+      Center(
+        child: CircleAvatar(
+          radius: 50,
+          backgroundColor: Colors.red[100],
+          child: Text(
+            inicial,
+            style: const TextStyle(
+              fontSize: 40,
+              fontWeight: FontWeight.bold,
+              color: Colors.red,
+            ),
+          ),
+        ),
+      ),
+      const SizedBox(height: 20),
+      if (_rolDesactualizado)
+        Card(
+          color: Colors.orange[50],
+          child: const ListTile(
+            leading: Icon(Icons.info_outline, color: Colors.orange),
+            title: Text("Tu rol fue actualizado"),
+            subtitle: Text(
+              "Cierra sesión y vuelve a iniciar para aplicar tus nuevos permisos.",
+            ),
+          ),
+        ),
+      _tarjetaDato(Icons.person, "Nombre Completo", nombre),
+      _tarjetaDato(Icons.email, "Correo Electrónico",
+          (data['email'] ?? '').toString()),
+      _tarjetaDato(
+          Icons.security, "Rol asignado", (data['rol'] ?? 'Usuario').toString()),
+      _tarjetaDato(Icons.calendar_today, "Miembro desde", miembroDesde),
+    ];
+  }
+
+  Widget _bloqueError() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 40),
+      child: Column(
+        children: [
+          const Icon(Icons.error_outline, size: 60, color: Colors.grey),
+          const SizedBox(height: 12),
+          Text(
+            _error ?? "Error al cargar la información del usuario",
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 16, color: Colors.grey),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            onPressed: _obtenerPerfil,
+            icon: const Icon(Icons.refresh),
+            label: const Text("Reintentar"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("Perfil de Usuario"),
+        backgroundColor: Colors.red,
+      ),
+      body: RefreshIndicator(
+        onRefresh: _obtenerPerfil,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.all(20),
+          children: [
+            if (_cargando && _usuarioData == null)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 60),
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else if (_usuarioData == null)
+              _bloqueError()
+            else
+              ..._contenidoPerfil(),
+            const SizedBox(height: 30),
+            // El botón de cerrar sesión siempre está disponible, incluso si falla la carga
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+                icon: const Icon(Icons.logout, color: Colors.white),
+                label: const Text(
+                  "CERRAR SESIÓN",
+                  style: TextStyle(color: Colors.white, fontSize: 16),
+                ),
+                onPressed: () => confirmarCierreSesion(context),
+              ),
+            ),
+            const SizedBox(height: 20),
+          ],
         ),
       ),
     );

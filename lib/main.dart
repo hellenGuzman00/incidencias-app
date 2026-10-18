@@ -1,10 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:printing/printing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 const String baseUrl = "https://incidencias-backend-abt2.onrender.com";
@@ -501,6 +505,17 @@ class _NavigationPageState extends State<NavigationPage> {
         ),
         backgroundColor: Colors.red,
         actions: [
+          IconButton(
+            icon: const Icon(Icons.picture_as_pdf),
+            tooltip: "Exportar reportes PDF",
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                    builder: (context) => const GenerarReportePage()),
+              );
+            },
+          ),
           IconButton(
             icon: const Icon(Icons.account_circle),
             tooltip: "Mi perfil",
@@ -1869,6 +1884,552 @@ class _PerfilPageState extends State<PerfilPage> {
               ),
             ),
             const SizedBox(height: 20),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// =========================================================
+// GENERACIÓN DE REPORTES PDF (Guía 9)
+// =========================================================
+class GenerarReportePage extends StatefulWidget {
+  const GenerarReportePage({super.key});
+
+  @override
+  State<GenerarReportePage> createState() => _GenerarReportePageState();
+}
+
+class _GenerarReportePageState extends State<GenerarReportePage> {
+  // Fechas elegidas en pantalla (opcionales)
+  DateTime? _fechaInicio;
+  DateTime? _fechaFin;
+
+  bool _cargando = false;
+  String? _error;
+  bool _consultado = false;
+  List<dynamic> _incidencias = [];
+
+  // Sube con cada consulta nueva para obligar a PdfPreview a regenerar el PDF
+  int _version = 0;
+
+  // Datos de la consulta que está en pantalla (para el encabezado del PDF)
+  DateTime? _rangoInicio;
+  DateTime? _rangoFin;
+  String _generadoPor = "";
+
+  String _dos(int n) => n.toString().padLeft(2, '0');
+
+  /// 05/10/2026
+  String _fmt(DateTime d) => "${_dos(d.day)}/${_dos(d.month)}/${d.year}";
+
+  /// 2026-10-05 (formato que espera el servidor)
+  String _aIso(DateTime d) => "${d.year}-${_dos(d.month)}-${_dos(d.day)}";
+
+  /// Zona horaria del dispositivo, por ejemplo "-06:00" en El Salvador.
+  /// El servidor la usa para que "hoy" signifique hoy en TU hora, no en UTC.
+  String _offsetZonaHoraria() {
+    final Duration d = DateTime.now().timeZoneOffset;
+    final String signo = d.isNegative ? '-' : '+';
+    final int minutos = d.inMinutes.abs();
+    return "$signo${_dos(minutos ~/ 60)}:${_dos(minutos % 60)}";
+  }
+
+  String _textoPeriodo() {
+    if (_rangoInicio == null && _rangoFin == null) return "Todo el historial";
+    if (_rangoInicio != null && _rangoFin != null) {
+      return "Del ${_fmt(_rangoInicio!)} al ${_fmt(_rangoFin!)}";
+    }
+    if (_rangoInicio != null) return "Desde el ${_fmt(_rangoInicio!)}";
+    return "Hasta el ${_fmt(_rangoFin!)}";
+  }
+
+  void _mostrar(String mensaje) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(mensaje)),
+    );
+  }
+
+  Future<void> _seleccionarFecha(bool esInicio) async {
+    final DateTime? elegida = await showDatePicker(
+      context: context,
+      initialDate: (esInicio ? _fechaInicio : _fechaFin) ?? DateTime.now(),
+      firstDate: DateTime(2020),
+      lastDate: DateTime(2100),
+    );
+    if (elegida != null && mounted) {
+      setState(() {
+        if (esInicio) {
+          _fechaInicio = elegida;
+        } else {
+          _fechaFin = elegida;
+        }
+      });
+    }
+  }
+
+  void _limpiarFechas() {
+    setState(() {
+      _fechaInicio = null;
+      _fechaFin = null;
+    });
+  }
+
+  /// Pide al servidor las incidencias del rango elegido (requiere sesión).
+  Future<void> _consultarDatos() async {
+    if (_fechaInicio != null &&
+        _fechaFin != null &&
+        _fechaInicio!.isAfter(_fechaFin!)) {
+      _mostrar("La fecha de inicio no puede ser posterior a la fecha de fin");
+      return;
+    }
+
+    setState(() {
+      _cargando = true;
+      _error = null;
+    });
+
+    try {
+      final token = await obtenerToken();
+      final prefs = await SharedPreferences.getInstance();
+      final String nombre = prefs.getString('nombre') ?? "";
+      final String rol = prefs.getString('rol') ?? "";
+
+      final Map<String, String> params = {'tz': _offsetZonaHoraria()};
+      if (_fechaInicio != null) params['fecha_inicio'] = _aIso(_fechaInicio!);
+      if (_fechaFin != null) params['fecha_fin'] = _aIso(_fechaFin!);
+
+      final uri = Uri.parse("$baseUrl/incidencias/exportar")
+          .replace(queryParameters: params);
+      final response = await http.get(
+        uri,
+        headers: {"Authorization": "Bearer $token"},
+      );
+
+      if (!mounted) return;
+
+      if (response.statusCode == 200) {
+        setState(() {
+          _incidencias = jsonDecode(response.body) as List<dynamic>;
+          _consultado = true;
+          _cargando = false;
+          _version++;
+          _rangoInicio = _fechaInicio;
+          _rangoFin = _fechaFin;
+          _generadoPor = nombre.isEmpty ? "" : "$nombre ($rol)";
+        });
+      } else if (response.statusCode == 401 || response.statusCode == 403) {
+        await sesionExpirada(context);
+      } else {
+        String mensaje = "No se pudieron cargar las incidencias";
+        try {
+          mensaje = (jsonDecode(response.body)['mensaje'] ?? mensaje).toString();
+        } catch (_) {}
+        setState(() {
+          _error = mensaje;
+          _cargando = false;
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = "Error de conexión. Verifica tu internet e intenta de nuevo.";
+        _cargando = false;
+      });
+    }
+  }
+
+  /// Cuadro de una cifra del resumen estadístico dentro del PDF.
+  pw.Widget _cajaResumen(String titulo, String valor, PdfColor color) {
+    return pw.Expanded(
+      child: pw.Container(
+        margin: const pw.EdgeInsets.only(right: 6),
+        padding: const pw.EdgeInsets.all(8),
+        decoration: pw.BoxDecoration(
+          color: PdfColors.grey100,
+          border: pw.Border.all(color: PdfColors.grey300),
+          borderRadius: pw.BorderRadius.circular(4),
+        ),
+        child: pw.Column(
+          children: [
+            pw.Text(
+              valor,
+              style: pw.TextStyle(
+                fontSize: 18,
+                fontWeight: pw.FontWeight.bold,
+                color: color,
+              ),
+            ),
+            pw.SizedBox(height: 2),
+            pw.Text(titulo, style: const pw.TextStyle(fontSize: 9)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Construye el documento PDF con los datos cargados.
+  Future<Uint8List> _generarPdf(PdfPageFormat format) async {
+    final pdf = pw.Document(
+      title: 'Reporte consolidado de incidencias',
+      author: 'INFRAMEN',
+    );
+
+    // ---- Resumen estadístico (se calcula con los mismos datos de la tabla) ----
+    final int total = _incidencias.length;
+    final int resueltas =
+        _incidencias.where((e) => e['estado'] == 'Resuelto').length;
+    final int pendientes = total - resueltas;
+    final String porcentaje =
+        total == 0 ? "0" : ((resueltas / total) * 100).toStringAsFixed(0);
+
+    final Map<String, List<int>> porCategoria = {};
+    for (final item in _incidencias) {
+      final String categoria = (item['categoria'] ?? 'Sin categoría').toString();
+      final List<int> fila = porCategoria.putIfAbsent(categoria, () => [0, 0, 0]);
+      fila[0]++; // total
+      if (item['estado'] == 'Resuelto') {
+        fila[2]++; // resueltas
+      } else {
+        fila[1]++; // pendientes
+      }
+    }
+    final categoriasOrdenadas = porCategoria.entries.toList()
+      ..sort((a, b) => b.value[0].compareTo(a.value[0]));
+
+    final DateTime ahora = DateTime.now();
+    final String generado = "${_fmt(ahora)} ${_dos(ahora.hour)}:${_dos(ahora.minute)}";
+
+    pdf.addPage(
+      pw.MultiPage(
+        pageFormat: format,
+        margin: const pw.EdgeInsets.all(32),
+        // Por defecto el paquete limita a 20 páginas; con historiales largos fallaría
+        maxPages: 500,
+        footer: (pw.Context ctx) => pw.Container(
+          alignment: pw.Alignment.centerRight,
+          margin: const pw.EdgeInsets.only(top: 8),
+          child: pw.Text(
+            "Página ${ctx.pageNumber} de ${ctx.pagesCount}",
+            style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey700),
+          ),
+        ),
+        build: (pw.Context ctx) => [
+          // ---------- Encabezado institucional ----------
+          pw.Container(
+            padding: const pw.EdgeInsets.symmetric(vertical: 10),
+            decoration: const pw.BoxDecoration(
+              border: pw.Border(
+                bottom: pw.BorderSide(color: PdfColors.red800, width: 2),
+              ),
+            ),
+            child: pw.Column(
+              children: [
+                pw.Text(
+                  "INSTITUTO NACIONAL 'GENERAL FRANCISCO MENENDEZ'",
+                  style: pw.TextStyle(
+                    fontSize: 14,
+                    fontWeight: pw.FontWeight.bold,
+                  ),
+                ),
+                pw.SizedBox(height: 3),
+                pw.Text(
+                  "INFRAMEN - Sistema de Gestión de Incidencias",
+                  style: const pw.TextStyle(fontSize: 11),
+                ),
+                pw.SizedBox(height: 6),
+                pw.Text(
+                  "REPORTE CONSOLIDADO DE INCIDENCIAS",
+                  style: pw.TextStyle(
+                    fontSize: 13,
+                    fontWeight: pw.FontWeight.bold,
+                    color: PdfColors.red800,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          pw.SizedBox(height: 10),
+          pw.Row(
+            mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+            children: [
+              pw.Text("Período: ${_textoPeriodo()}",
+                  style: const pw.TextStyle(fontSize: 10)),
+              pw.Text("Generado: $generado",
+                  style: const pw.TextStyle(fontSize: 10)),
+            ],
+          ),
+          if (_generadoPor.isNotEmpty)
+            pw.Text("Generado por: $_generadoPor",
+                style: const pw.TextStyle(fontSize: 10)),
+
+          // ---------- Resumen estadístico ----------
+          pw.SizedBox(height: 16),
+          pw.Text(
+            "RESUMEN ESTADÍSTICO",
+            style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold),
+          ),
+          pw.SizedBox(height: 6),
+          pw.Row(
+            children: [
+              _cajaResumen("Total de incidencias", "$total", PdfColors.grey800),
+              _cajaResumen("Pendientes", "$pendientes", PdfColors.orange800),
+              _cajaResumen("Resueltas", "$resueltas", PdfColors.green800),
+              _cajaResumen("% Resueltas", "$porcentaje%", PdfColors.red800),
+            ],
+          ),
+          pw.SizedBox(height: 10),
+          pw.TableHelper.fromTextArray(
+            headers: ['Categoría', 'Total', 'Pendientes', 'Resueltas'],
+            data: categoriasOrdenadas
+                .map((e) => [
+                      e.key,
+                      '${e.value[0]}',
+                      '${e.value[1]}',
+                      '${e.value[2]}',
+                    ])
+                .toList(),
+            headerStyle: pw.TextStyle(
+              fontSize: 10,
+              fontWeight: pw.FontWeight.bold,
+              color: PdfColors.white,
+            ),
+            headerDecoration: const pw.BoxDecoration(color: PdfColors.red800),
+            cellStyle: const pw.TextStyle(fontSize: 10),
+            border: pw.TableBorder.all(color: PdfColors.grey300, width: 0.5),
+            columnWidths: {
+              0: const pw.FlexColumnWidth(3),
+              1: const pw.FlexColumnWidth(1),
+              2: const pw.FlexColumnWidth(1.4),
+              3: const pw.FlexColumnWidth(1.4),
+            },
+            cellAlignments: {
+              0: pw.Alignment.centerLeft,
+              1: pw.Alignment.center,
+              2: pw.Alignment.center,
+              3: pw.Alignment.center,
+            },
+          ),
+
+          // ---------- Detalle de incidencias ----------
+          pw.SizedBox(height: 18),
+          pw.Text(
+            "DETALLE DE INCIDENCIAS",
+            style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold),
+          ),
+          pw.SizedBox(height: 6),
+          pw.TableHelper.fromTextArray(
+            headers: ['ID', 'Categoría', 'Descripción', 'Estado', 'Fecha'],
+            data: _incidencias
+                .map((item) => [
+                      item['id'].toString(),
+                      (item['categoria'] ?? '').toString(),
+                      (item['descripcion'] ?? '').toString(),
+                      (item['estado'] ?? '').toString(),
+                      formatearFecha(item['fecha']),
+                    ])
+                .toList(),
+            headerStyle: pw.TextStyle(
+              fontSize: 10,
+              fontWeight: pw.FontWeight.bold,
+              color: PdfColors.white,
+            ),
+            headerDecoration: const pw.BoxDecoration(color: PdfColors.red800),
+            cellStyle: const pw.TextStyle(fontSize: 9),
+            oddRowDecoration: const pw.BoxDecoration(color: PdfColors.grey100),
+            border: pw.TableBorder.all(color: PdfColors.grey300, width: 0.5),
+            columnWidths: {
+              0: const pw.FixedColumnWidth(28),
+              1: const pw.FlexColumnWidth(2.2),
+              2: const pw.FlexColumnWidth(5),
+              3: const pw.FlexColumnWidth(1.8),
+              4: const pw.FlexColumnWidth(2.6),
+            },
+            cellAlignments: {
+              0: pw.Alignment.center,
+              1: pw.Alignment.centerLeft,
+              2: pw.Alignment.centerLeft,
+              3: pw.Alignment.center,
+              4: pw.Alignment.center,
+            },
+          ),
+          pw.SizedBox(height: 16),
+          pw.Align(
+            alignment: pw.Alignment.centerRight,
+            child: pw.Text(
+              "Total de incidencias reportadas: $total",
+              style: pw.TextStyle(fontWeight: pw.FontWeight.bold),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    return pdf.save();
+  }
+
+  Widget _vistaPrevia() {
+    return PdfPreview(
+      // La llave cambia con cada consulta: así la vista previa se regenera con los datos nuevos
+      key: ValueKey(_version),
+      build: _generarPdf,
+      allowPrinting: true,
+      allowSharing: true,
+      canChangeOrientation: false,
+      canChangePageFormat: false,
+      canDebug: false,
+      pdfFileName: "reporte_incidencias_${_aIso(DateTime.now())}.pdf",
+    );
+  }
+
+  Widget _contenido() {
+    if (_cargando) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.error_outline, size: 60, color: Colors.grey),
+            const SizedBox(height: 10),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Text(
+                _error!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 15, color: Colors.grey),
+              ),
+            ),
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              onPressed: _consultarDatos,
+              icon: const Icon(Icons.refresh),
+              label: const Text("Reintentar"),
+            ),
+          ],
+        ),
+      );
+    }
+    if (!_consultado) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(20),
+          child: Text(
+            "Elige un rango de fechas (opcional) y presiona\n\"Cargar Datos para PDF\"",
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 15, color: Colors.grey),
+          ),
+        ),
+      );
+    }
+    if (_incidencias.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(20),
+          child: Text(
+            "No se encontraron incidencias en el rango seleccionado",
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 15, color: Colors.grey),
+          ),
+        ),
+      );
+    }
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: Text(
+            "${_incidencias.length} incidencias listas para exportar (${_textoPeriodo()})",
+            style: TextStyle(color: Colors.grey[700], fontSize: 13),
+            textAlign: TextAlign.center,
+          ),
+        ),
+        Expanded(child: _vistaPrevia()),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("Exportar Reportes PDF"),
+        backgroundColor: Colors.red,
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(10),
+                child: Column(
+                  children: [
+                    const Text(
+                      "Filtro por Rango de Fechas",
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      "Déjalas vacías para exportar todo el historial",
+                      style: TextStyle(color: Colors.grey[600], fontSize: 12),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            icon: const Icon(Icons.date_range),
+                            label: Text(_fechaInicio == null
+                                ? "Fecha Inicio"
+                                : _fmt(_fechaInicio!)),
+                            onPressed: () => _seleccionarFecha(true),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            icon: const Icon(Icons.date_range),
+                            label: Text(_fechaFin == null
+                                ? "Fecha Fin"
+                                : _fmt(_fechaFin!)),
+                            onPressed: () => _seleccionarFecha(false),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (_fechaInicio != null || _fechaFin != null)
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: TextButton.icon(
+                          onPressed: _limpiarFechas,
+                          icon: const Icon(Icons.clear, size: 18),
+                          label: const Text("Quitar fechas"),
+                        ),
+                      ),
+                    const SizedBox(height: 6),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.red),
+                        onPressed: _cargando ? null : _consultarDatos,
+                        icon: const Icon(Icons.picture_as_pdf,
+                            color: Colors.white),
+                        label: const Text(
+                          "Cargar Datos para PDF",
+                          style: TextStyle(color: Colors.white),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Expanded(child: _contenido()),
           ],
         ),
       ),
